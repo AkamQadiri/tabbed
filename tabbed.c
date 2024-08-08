@@ -81,6 +81,7 @@ typedef struct {
 
 typedef struct {
 	char name[256];
+	char *basename;
 	Window win;
 	int tabx;
 	Bool urgent;
@@ -107,6 +108,7 @@ static void focusonce(const Arg *arg);
 static void focusurgent(const Arg *arg);
 static void fullscreen(const Arg *arg);
 static char *getatom(int a);
+static char *getbasename(const char *name);
 static int getclient(Window w);
 static XftColor getcolor(const char *colstr);
 static int getfirsttab(void);
@@ -152,11 +154,11 @@ static void (*handler[LASTEvent]) (const XEvent *) = {
 	[MapRequest] = maprequest,
 	[PropertyNotify] = propertynotify,
 };
-static int bh, obh, wx, wy, ww, wh;
+static int bh, obh, wx, wy, ww, wh, vbh;
 static unsigned int numlockmask;
 static Bool running = True, nextfocus, doinitspawn = True,
             fillagain = False, closelastclient = False,
-            killclientsfirst = False;
+			killclientsfirst = False, basenametitles = False;
 static Display *dpy;
 static DC dc;
 static Atom wmatom[WMLast];
@@ -169,6 +171,9 @@ static char winid[64];
 static char **cmd;
 static char *wmname = "tabbed";
 static const char *geometry;
+
+static Colormap cmap;
+static Visual *visual = NULL;
 
 char *argv0;
 
@@ -254,8 +259,8 @@ configurenotify(const XEvent *e)
 		ww = ev->width;
 		wh = ev->height;
 		XFreePixmap(dpy, dc.drawable);
-		dc.drawable = XCreatePixmap(dpy, root, ww, wh,
-		              DefaultDepth(dpy, screen));
+		dc.drawable = XCreatePixmap(dpy, win, ww, wh,
+		              32);
 
 		if (!obh && (wh <= bh)) {
 			obh = bh;
@@ -324,7 +329,7 @@ void
 drawbar(void)
 {
 	XftColor *col;
-	int c, cc, fc, width;
+	int c, cc, fc, width, nbh, i;
 	char *name = NULL;
 
 	if (nclients == 0) {
@@ -332,11 +337,20 @@ drawbar(void)
 		dc.w = ww;
 		XFetchName(dpy, win, &name);
 		drawtext(name ? name : "", dc.norm);
-		XCopyArea(dpy, dc.drawable, win, dc.gc, 0, 0, ww, bh, 0, 0);
+		XCopyArea(dpy, dc.drawable, win, dc.gc, 0, 0, ww, vbh, 0, 0);
 		XSync(dpy, False);
 
 		return;
 	}
+
+	nbh = nclients > 1 ? vbh : 0;
+	if (bh != nbh) {
+		bh = nbh;
+		for (i = 0; i < nclients; i++)
+			XMoveResizeWindow(dpy, clients[i]->win, 0, bh, ww, wh - bh);
+		}
+	if (bh == 0)
+		return;
 
 	width = ww;
 	cc = ww / tabwidth;
@@ -367,7 +381,10 @@ drawbar(void)
 		} else {
 			col = clients[c]->urgent ? dc.urg : dc.norm;
 		}
-		drawtext(clients[c]->name, col);
+		if (basenametitles)
+			drawtext(clients[c]->basename, col);
+		else
+			drawtext(clients[c]->name, col);
 		dc.x += dc.w;
 		clients[c]->tabx = dc.x;
 	}
@@ -406,8 +423,10 @@ drawtext(const char *text, XftColor col[ColLast])
 		     buf[--i] = titletrim[--j])
 			;
 	}
+	else
+		x += (dc.w - TEXTW(buf)) / 2; // center text
 
-	d = XftDrawCreate(dpy, dc.drawable, DefaultVisual(dpy, screen), DefaultColormap(dpy, screen));
+	d = XftDrawCreate(dpy, dc.drawable, visual, cmap);
 	XftDrawStringUtf8(d, &col[ColFG], dc.font.xfont, x, y, (XftChar8 *) buf, len);
 	XftDrawDestroy(d);
 }
@@ -557,6 +576,16 @@ getatom(int a)
 	return buf;
 }
 
+char *
+getbasename(const char *name)
+{
+	char *pos = strrchr(name, '/');
+	if (pos)
+		return pos+1;
+	else
+		return (char *)name;
+}
+
 int
 getclient(Window w)
 {
@@ -575,7 +604,7 @@ getcolor(const char *colstr)
 {
 	XftColor color;
 
-	if (!XftColorAllocName(dpy, DefaultVisual(dpy, screen), DefaultColormap(dpy, screen), colstr, &color))
+  if (!XftColorAllocName(dpy, visual, cmap, colstr, &color))
 		die("%s: cannot allocate color '%s'\n", argv0, colstr);
 
 	return color;
@@ -991,7 +1020,7 @@ setup(void)
 	screen = DefaultScreen(dpy);
 	root = RootWindow(dpy, screen);
 	initfont(font);
-	bh = dc.h = dc.font.height + 2;
+	vbh = dc.h = dc.font.height + 2;
 
 	/* init atoms */
 	wmatom[WMDelete] = XInternAtom(dpy, "WM_DELETE_WINDOW", False);
@@ -1037,18 +1066,60 @@ setup(void)
 			wy = dh + wy - wh - 1;
 	}
 
+	XVisualInfo *vis;
+	XRenderPictFormat *fmt;
+	int nvi;
+	int i;
+
+	XVisualInfo tpl = {
+		.screen = screen,
+		.depth = 32,
+		.class = TrueColor
+	};
+
+	vis = XGetVisualInfo(dpy, VisualScreenMask | VisualDepthMask | VisualClassMask, &tpl, &nvi);
+	for(i = 0; i < nvi; i ++) {
+		fmt = XRenderFindVisualFormat(dpy, vis[i].visual);
+		if (fmt->type == PictTypeDirect && fmt->direct.alphaMask) {
+			visual = vis[i].visual;
+			break;
+		}
+	}
+
+	XFree(vis);
+
+	if (! visual) {
+		fprintf(stderr, "Couldn't find ARGB visual.\n");
+		exit(1);
+	}
+
+	cmap = XCreateColormap( dpy, root, visual, None);
 	dc.norm[ColBG] = getcolor(normbgcolor);
 	dc.norm[ColFG] = getcolor(normfgcolor);
 	dc.sel[ColBG] = getcolor(selbgcolor);
 	dc.sel[ColFG] = getcolor(selfgcolor);
 	dc.urg[ColBG] = getcolor(urgbgcolor);
 	dc.urg[ColFG] = getcolor(urgfgcolor);
-	dc.drawable = XCreatePixmap(dpy, root, ww, wh,
-	                            DefaultDepth(dpy, screen));
-	dc.gc = XCreateGC(dpy, root, 0, 0);
 
-	win = XCreateSimpleWindow(dpy, root, wx, wy, ww, wh, 0,
-	                          dc.norm[ColFG].pixel, dc.norm[ColBG].pixel);
+	XSetWindowAttributes attrs;
+	attrs.background_pixel = dc.norm[ColBG].pixel;
+	attrs.border_pixel = dc.norm[ColFG].pixel;
+	attrs.bit_gravity = NorthWestGravity;
+	attrs.event_mask = FocusChangeMask | KeyPressMask
+		| ExposureMask | VisibilityChangeMask | StructureNotifyMask
+		| ButtonMotionMask | ButtonPressMask | ButtonReleaseMask;
+	attrs.background_pixmap = None ;
+	attrs.colormap = cmap;
+
+	win = XCreateWindow(dpy, root, wx, wy,
+	ww, wh, 0, 32, InputOutput,
+	visual, CWBackPixmap | CWBorderPixel | CWBitGravity
+	| CWEventMask | CWColormap, &attrs);
+
+	dc.drawable = XCreatePixmap(dpy, win, ww, wh,
+	                            32);
+	dc.gc = XCreateGC(dpy, dc.drawable, 0, 0);
+
 	XMapRaised(dpy, win);
 	XSelectInput(dpy, win, SubstructureNotifyMask | FocusChangeMask |
 	             ButtonPressMask | ExposureMask | KeyPressMask |
@@ -1223,6 +1294,8 @@ updatetitle(int c)
 	    sizeof(clients[c]->name)))
 		gettextprop(clients[c]->win, XA_WM_NAME, clients[c]->name,
 		            sizeof(clients[c]->name));
+	if (basenametitles)
+		clients[c]->basename = getbasename(clients[c]->name);
 	if (sel == c)
 		xsettitle(win, clients[c]->name);
 	drawbar();
@@ -1338,6 +1411,9 @@ main(int argc, char *argv[])
 		break;
 	case 'u':
 		urgbgcolor = EARGF(usage());
+		break;
+	case 'b':
+		basenametitles = True;
 		break;
 	case 'v':
 		die("tabbed-"VERSION", © 2009-2016 tabbed engineers, "
